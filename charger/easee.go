@@ -31,6 +31,7 @@ import (
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/charger/easee"
 	"github.com/evcc-io/evcc/core/loadpoint"
+	"github.com/evcc-io/evcc/plugin"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
 	"github.com/evcc-io/evcc/util/sponsor"
@@ -72,6 +73,16 @@ type Easee struct {
 	lp               loadpoint.API
 
 	dispatcher *easee.CommandDispatcher
+
+	// MQTT is preferred for live measurements/status. Cloud observations remain
+	// the fallback when MQTT has no current value.
+	mqttPower         func() (float64, error)
+	mqttSessionEnergy func() (float64, error)
+	mqttCurrentL1     func() (float64, error)
+	mqttCurrentL2     func() (float64, error)
+	mqttCurrentL3     func() (float64, error)
+	mqttStatus        func() (string, error)
+	mqttMaxCurrent    func(int64) error
 
 	obsC            chan easee.Observation
 	obsTime         map[easee.ObservationID]time.Time
@@ -156,6 +167,11 @@ func NewEasee(ctx context.Context, user, password, charger string, timeout time.
 		c.charger = chargers[0].ID
 	}
 
+	// Configure MQTT after the charger ID is known. MQTT is intentionally not
+	// part of the Easee configuration: if the global MQTT connection is
+	// available, current MQTT values are preferred over cloud observations.
+	c.configureMQTT(ctx)
+
 	// find site
 	site, err := c.chargerSite(c.charger)
 	if err != nil {
@@ -199,6 +215,74 @@ func NewEasee(ctx context.Context, user, password, charger string, timeout time.
 	}
 
 	return c, err
+}
+
+func (c *Easee) configureMQTT(ctx context.Context) {
+	const mqttTimeout = 30 * time.Second
+	base := fmt.Sprintf("easee/%s", c.charger)
+
+	newGetter := func(topic string, scale float64) *plugin.Config {
+		return &plugin.Config{
+			Source: "mqtt",
+			Other: map[string]any{
+				"topic":   topic,
+				"timeout": mqttTimeout,
+				"scale":   scale,
+			},
+		}
+	}
+
+	var err error
+
+	c.mqttPower, err = newGetter(base+"/power", 1000).FloatGetter(ctx)
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT power unavailable, using Easee cloud fallback: %v", err)
+		c.mqttPower = nil
+	}
+
+	c.mqttSessionEnergy, err = newGetter(base+"/sessionenergy", 1).FloatGetter(ctx)
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT session energy unavailable, using Easee cloud fallback: %v", err)
+		c.mqttSessionEnergy = nil
+	}
+
+	c.mqttCurrentL1, err = newGetter(base+"/current/L1", 1).FloatGetter(ctx)
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT current L1 unavailable, using Easee cloud fallback: %v", err)
+		c.mqttCurrentL1 = nil
+	}
+
+	c.mqttCurrentL2, err = newGetter(base+"/current/L2", 1).FloatGetter(ctx)
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT current L2 unavailable, using Easee cloud fallback: %v", err)
+		c.mqttCurrentL2 = nil
+	}
+
+	c.mqttCurrentL3, err = newGetter(base+"/current/L3", 1).FloatGetter(ctx)
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT current L3 unavailable, using Easee cloud fallback: %v", err)
+		c.mqttCurrentL3 = nil
+	}
+
+	c.mqttStatus, err = newGetter(base+"/status", 1).StringGetter(ctx)
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT status unavailable, using Easee cloud fallback: %v", err)
+		c.mqttStatus = nil
+	}
+
+	// The target current is always written through MQTT. There is deliberately
+	// no cloud fallback for this operation.
+	c.mqttMaxCurrent, err = (&plugin.Config{
+		Source: "mqtt",
+		Other: map[string]any{
+			"topic":   base + "/set/current",
+			"payload": "${maxcurrent:%d}",
+		},
+	}).IntSetter(ctx, "maxcurrent")
+	if err != nil {
+		c.log.DEBUG.Printf("MQTT max current unavailable: %v", err)
+		c.mqttMaxCurrent = nil
+	}
 }
 
 func (c *Easee) waitForOptionalState() {
@@ -468,6 +552,26 @@ func (c *Easee) chargers() ([]easee.Charger, error) {
 func (c *Easee) Status() (api.ChargeStatus, error) {
 	c.updateSmartCharging()
 
+	// Prefer MQTT when both status and charging are current. The MQTT plugin
+	// returns api.ErrOutdated after the configured timeout, so the existing
+	// Easee cloud state remains the fallback.
+	if c.mqttStatus != nil {
+		status, statusErr := c.mqttStatus()
+
+		if statusErr == nil {
+			switch status {
+			case "disconnected":
+				return api.StatusA, nil
+			case "charging":
+				return api.StatusC, nil
+			default:
+				return api.StatusB, nil
+			}
+		} else {
+			c.log.DEBUG.Printf("MQTT status unavailable, using Easee cloud fallback: %v", statusErr)
+		}
+	}
+
 	c.mux.RLock()
 	defer c.mux.RUnlock()
 
@@ -637,25 +741,21 @@ func (c *Easee) MaxCurrent(current int64) error {
 	if c.maxChargerCurrent != 0 {
 		cur = min(cur, c.maxChargerCurrent)
 	}
-	data := easee.ChargerSettings{
-		DynamicChargerCurrent: &cur,
+
+	// The desired current is always written via MQTT. There is intentionally
+	// no fallback to the Easee cloud API.
+	if c.mqttMaxCurrent == nil {
+		return errors.New("MQTT max current setter unavailable")
 	}
 
-	uri := fmt.Sprintf("%s/chargers/%s/settings", easee.API, c.charger)
-	noop, err := c.dispatcher.Send(uri, data)
-	if err != nil {
+	if err := c.mqttMaxCurrent(int64(cur)); err != nil {
 		return err
 	}
 
-	if !noop {
-		if err := c.waitForDynamicChargerCurrent(cur); err != nil {
-			return err
-		}
-	}
-
 	c.mux.Lock()
-	defer c.mux.Unlock()
 	c.current = cur
+	c.dynamicChargerCurrent = cur
+	c.mux.Unlock()
 
 	return nil
 }
@@ -673,6 +773,18 @@ var _ api.Meter = (*Easee)(nil)
 
 // CurrentPower implements the api.Meter interface
 func (c *Easee) CurrentPower() (float64, error) {
+	// MQTT publishes power in kW. The getter is configured with scale 1000,
+	// therefore the value returned here is already in W.
+	if c.mqttPower != nil {
+		if power, err := c.mqttPower(); err == nil {
+			return power, nil
+		} else {
+			c.log.DEBUG.Printf("MQTT power 1 unavailable, using Easee cloud fallback: %v", err)
+		}
+	} else {
+		c.log.DEBUG.Printf("MQTT power 2 unavailable, using Easee cloud fallback")
+	}	
+
 	if status, err := c.Status(); err != nil || status == api.StatusA {
 		return 0, err
 	}
@@ -691,6 +803,16 @@ var _ api.ChargeRater = (*Easee)(nil)
 
 // ChargedEnergy implements the api.ChargeRater interface
 func (c *Easee) ChargedEnergy() (float64, error) {
+	if c.mqttSessionEnergy != nil {
+		if sessionEnergy, err := c.mqttSessionEnergy(); err == nil {
+			return sessionEnergy, nil
+		} else {
+			c.log.DEBUG.Printf("MQTT session energy 1 unavailable, using Easee cloud fallback: %v", err)
+		}
+	} else {
+		c.log.DEBUG.Printf("MQTT session energy 2 unavailable, using Easee cloud fallback")
+	}
+
 	c.mux.RLock()
 	defer c.mux.RUnlock()
 	return c.sessionEnergy, nil
@@ -700,6 +822,17 @@ var _ api.PhaseCurrents = (*Easee)(nil)
 
 // Currents implements the api.PhaseCurrents interface
 func (c *Easee) Currents() (float64, float64, float64, error) {
+	// Only use MQTT when all three phase currents are current. This avoids
+	// mixing MQTT values with an older cloud observation.
+	if c.mqttCurrentL1 != nil && c.mqttCurrentL2 != nil && c.mqttCurrentL3 != nil {
+		l1, err1 := c.mqttCurrentL1()
+		l2, err2 := c.mqttCurrentL2()
+		l3, err3 := c.mqttCurrentL3()
+		if err1 == nil && err2 == nil && err3 == nil {
+			return l1, l2, l3, nil
+		}
+	}
+
 	c.mux.RLock()
 	defer c.mux.RUnlock()
 
@@ -763,10 +896,14 @@ func (c *Easee) Phases1p3p(phases int) error {
 		if err != nil {
 			c.dispatcher.CancelOrphan(easee.CIRCUIT_MAX_CURRENT_P1)
 		}
+		
+		c.mux.RLock()
+		activeSession := c.opMode == easee.ModeCharging
+		c.mux.RUnlock()
 
 		// Sending DCC:7 to skip charge pause after scaling down to 1p.
 		// The loadpoint's next control interval will send the real target current.
-		if err == nil && phases == 1 {
+		if err == nil && phases == 1 && activeSession {
 			override := 7.0
 			chargerData := easee.ChargerSettings{
 				DynamicChargerCurrent: &override,
@@ -864,7 +1001,7 @@ func (c *Easee) updateSmartCharging() {
 	}
 
 	mode := c.lp.GetMode()
-	isSmartCharging := mode == api.ModeSmart
+	isSmartCharging := mode == api.ModePV || mode == api.ModeMinPV
 
 	c.mux.Lock()
 	updateNeeded := c.opMode != easee.ModeDisconnected && isSmartCharging != c.smartCharging
