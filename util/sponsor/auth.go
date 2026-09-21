@@ -49,7 +49,7 @@ func machineID() string {
 const unavailable = "sponsorship unavailable"
 
 // startupTimeout leaves the network time to settle at boot; grpc retries dialing with backoff until deadline
-const startupTimeout = 30 * time.Second
+const startupTimeout = 1 * time.Millisecond
 
 func IsAuthorized() bool {
 	mu.RLock()
